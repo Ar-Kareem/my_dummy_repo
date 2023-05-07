@@ -10,7 +10,7 @@ from llama.model import Transformer
 
 
 class LLaMA:
-    def __init__(self, model: Transformer, tokenizer: Tokenizer):
+    def __init__(self, model: Transformer, tokenizer: Tokenizer) -> None:
         self.model = model
         self.tokenizer = tokenizer
 
@@ -23,9 +23,10 @@ class LLaMA:
     ) -> List[str]:
         bsz = len(prompts)
         params = self.model.params
-        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        self.model.enable_cache()
 
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        prompt_tokens = [x[-(2048 - max_gen_len):] for x in prompt_tokens]
 
         min_prompt_size = min([len(t) for t in prompt_tokens])
         max_prompt_size = max([len(t) for t in prompt_tokens])
@@ -39,7 +40,7 @@ class LLaMA:
         start_pos = min_prompt_size
         prev_pos = 0
         for cur_pos in range(start_pos, total_len):
-            logits = self.model.forward_only(tokens[:, prev_pos:cur_pos], prev_pos)
+            logits = self.model.forward_inference(tokens[:, prev_pos:cur_pos], prev_pos)
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -53,10 +54,12 @@ class LLaMA:
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
 
+        self.model.disable_cache()
+
         decoded = []
         for i, t in enumerate(tokens.tolist()):
             # cut to max gen len
-            t = t[: len(prompt_tokens[i]) + max_gen_len]
+            t = t[len(prompt_tokens[i]): len(prompt_tokens[i]) + max_gen_len]
             # cut to eos tok if any
             try:
                 t = t[: t.index(self.tokenizer.eos_id)]

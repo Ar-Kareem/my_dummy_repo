@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the GNU General Public License version 3.
 
+import sys
 from typing import Optional, Tuple
 from dataclasses import dataclass
 import math
@@ -8,6 +9,8 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint
 
 import fairscale.nn.model_parallel.initialize as fs_init
 from fairscale.nn.model_parallel.layers import (
@@ -16,9 +19,6 @@ from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
 )
 
-from torch.nn import Embedding, Linear
-import torch
-import pdb
 @dataclass
 class ModelArgs:
     dim: int = 512
@@ -28,10 +28,14 @@ class ModelArgs:
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     norm_eps: float = 1e-5
 
-    max_batch_size: int = 32
     max_seq_len: int = 2048
-    adapter_len: int=10
-    adapter_layer: int=30
+
+    adapter_len: int = 0
+    adapter_layer: int = 0
+
+    add_bias: bool = False
+    add_scale: bool = False
+    train_norm: bool = False
 
 
 class RMSNorm(torch.nn.Module):
@@ -45,7 +49,7 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        return (output * self.weight).type_as(x)
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -77,46 +81,88 @@ def apply_rotary_emb(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
+def forward_linear_with_scale_and_bias(x, module, scale=None, bias=None):
+    if scale is not None:
+        x = x * scale
+    x = module(x)
+    if bias is not None:
+        x = x + bias
+    return x
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-        self.n_local_heads = args.n_heads
+        self.n_local_heads = args.n_heads // fs_init.get_model_parallel_world_size()
         self.head_dim = args.dim // args.n_heads
+        self.dim = args.dim
 
-        self.wq = Linear(
+        self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wk = Linear(
+        self.wk = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wv = Linear(
+        self.wv = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
-            bias=False
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        self.wo = Linear(
+        self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
-            bias=False
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x
         )
 
-        self.cache_k = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
-        self.cache_v = torch.zeros(
-            (args.max_batch_size, args.max_seq_len, self.n_local_heads, self.head_dim)
-        ).cuda()
-        self.gate = torch.nn.Parameter(torch.zeros(1, self.n_local_heads, 1, 1))
+        self.gate = torch.nn.Parameter(torch.zeros(1, args.n_heads, 1, 1))
+        self.head_start = self.n_local_heads * fs_init.get_model_parallel_rank()
+        self.head_end = self.n_local_heads * (fs_init.get_model_parallel_rank() + 1)
+
+        self.cache_enabled = False
+        self.cache_k, self.cache_v = None, None
+
+        if args.add_bias:
+            self.wq_bias, self.wk_bias, self.wv_bias = [
+                nn.Parameter(torch.zeros([self.n_local_heads * self.head_dim])) 
+                for _ in range(3)
+            ]
+            self.wo_bias = nn.Parameter(torch.zeros([args.dim]))
+        else:
+            self.wq_bias = self.wk_bias = self.wv_bias = self.wo_bias = None
+
+        if args.add_scale:
+            self.wq_scale, self.wk_scale, self.wv_scale = [
+                nn.Parameter(torch.ones([args.dim]))
+                for _ in range(3)
+            ]
+            self.wo_scale = nn.Parameter(torch.ones([self.n_local_heads * self.head_dim]))
+        else:
+            self.wq_scale = self.wk_scale = self.wv_scale = self.wo_scale = None
+
+    def enable_cache(self):
+        self.cache_enabled = True
+
+    def disable_cache(self):
+        self.cache_enabled = False
+        self.cache_k, self.cache_v = None, None
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor], adapter=None):
-
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = forward_linear_with_scale_and_bias(x, self.wq, self.wq_scale, self.wq_bias)
+        xk = forward_linear_with_scale_and_bias(x, self.wk, self.wk_scale, self.wk_bias)
+        xv = forward_linear_with_scale_and_bias(x, self.wv, self.wv_scale, self.wv_bias)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -126,32 +172,48 @@ class Attention(nn.Module):
 
         if adapter is not None:
             adapter_len = adapter.shape[1]
-            adapter_k = self.wk(adapter).view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
-            adapter_v = self.wv(adapter).view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
-            xk = torch.cat([adapter_k, xk], dim=1)
-            xv = torch.cat([adapter_v, xv], dim=1)
-            extra_mask = torch.zeros(1, 1, seqlen, adapter_len).to(mask)
-            mask = torch.cat([extra_mask, mask], dim=-1)
+            adapter_k = forward_linear_with_scale_and_bias(adapter, self.wk, self.wk_scale, self.wk_bias)
+            adapter_k = adapter_k.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
+            adapter_v = forward_linear_with_scale_and_bias(adapter, self.wv, self.wv_scale, self.wv_bias)
+            adapter_v = adapter_v.view(1, adapter_len, self.n_local_heads, self.head_dim).repeat(bsz, 1, 1, 1)
+            adapter_k = adapter_k.transpose(1, 2)
+            adapter_v = adapter_v.transpose(1, 2)
         keys = xk
         values = xv
-
 
         xq = xq.transpose(1, 2)
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, slen, cache_len + slen)
+
+        if self.cache_enabled:
+            if self.cache_k is None:
+                assert start_pos == 0
+                self.cache_k, self.cache_v = keys, values
+            else:
+                assert self.cache_k.size(2) >= start_pos
+                self.cache_k = torch.cat([self.cache_k[:, :, :start_pos], keys], dim=2)
+                self.cache_v = torch.cat([self.cache_v[:, :, :start_pos], values], dim=2)
+                keys, values = self.cache_k, self.cache_v
+
+        output = self._forward_scaled_dot_product_attention(xq, keys, values, mask)
         if adapter is not None:
-            scores = torch.cat([self.gate.tanh().half() * F.softmax(scores[:, :, :, :adapter_len].float(), dim=-1).type_as(xq), F.softmax(scores[:, :, :, adapter_len:].float(), dim=-1).type_as(xq)], dim=-1)
-        else:
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, slen, head_dim)
+            output += self.gate[:, self.head_start: self.head_end].tanh().half() * self._forward_scaled_dot_product_attention(xq, adapter_k, adapter_v)
         output = output.transpose(
             1, 2
         ).contiguous().view(bsz, seqlen, -1)
 
-        return self.wo(output)
+        return forward_linear_with_scale_and_bias(output, self.wo, self.wo_scale, self.wo_bias)
+
+    def _forward_scaled_dot_product_attention(self, q, k, v, mask=None):
+        if hasattr(F, 'scaled_dot_product_attention'):
+            return F.scaled_dot_product_attention(q, k, v, mask >= 0 if mask is not None else None)
+        else:
+            scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask
+            scores = F.softmax(scores.float(), dim=-1).type_as(q)
+            output = torch.matmul(scores, v)
+            return output
 
 
 class FeedForward(nn.Module):
@@ -160,23 +222,53 @@ class FeedForward(nn.Module):
         dim: int,
         hidden_dim: int,
         multiple_of: int,
+        add_bias: bool = False,
+        add_scale: bool = False,
     ):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = Linear(
-            dim, hidden_dim, bias=False
+        self.dim, self.hidden_dim = dim, hidden_dim
+        mp_size = fs_init.get_model_parallel_world_size()
+        mp_rank = fs_init.get_model_parallel_rank()
+        self.mp_dim_st = self.hidden_dim // mp_size * mp_rank
+        self.mp_dim_ed = self.hidden_dim // mp_size * (mp_rank + 1)
+
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
-        self.w2 = Linear(
-            hidden_dim, dim, bias=False
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
-        self.w3 = Linear(
-            dim, hidden_dim, bias=False
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
+        if add_bias:
+            self.w1_bias, self.w3_bias = [
+                nn.Parameter(torch.zeros([hidden_dim // mp_size]))
+                for _ in range(2)
+            ]
+            self.w2_bias = nn.Parameter(torch.zeros([dim]))
+        else:
+            self.w1_bias = self.w2_bias = self.w3_bias = None
+
+        if add_scale:
+            self.w1_scale, self.w3_scale = [
+                nn.Parameter(torch.ones([dim]))
+                for _ in range(2)
+            ]
+            self.w2_scale = nn.Parameter(torch.ones([hidden_dim // mp_size]))
+        else:
+            self.w1_scale = self.w2_scale = self.w3_scale = None
+
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return forward_linear_with_scale_and_bias(
+            F.silu(forward_linear_with_scale_and_bias(x, self.w1, self.w1_scale, self.w1_bias)) *
+            forward_linear_with_scale_and_bias(x, self.w3, self.w3_scale, self.w3_bias),
+            self.w2, self.w2_scale, self.w2_bias
+            )
 
 
 class TransformerBlock(nn.Module):
@@ -187,7 +279,8 @@ class TransformerBlock(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.attention = Attention(args)
         self.feed_forward = FeedForward(
-            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of
+            dim=args.dim, hidden_dim=4 * args.dim, multiple_of=args.multiple_of,
+            add_bias=args.add_bias, add_scale=args.add_scale,
         )
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
@@ -206,12 +299,12 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-        self.tok_embeddings = Embedding(
-            params.vocab_size, params.dim
+        self.tok_embeddings = ParallelEmbedding(
+            params.vocab_size, params.dim, init_method=lambda x: x
         )
 
-
-        self.adapter_query = nn.Embedding(params.adapter_len * params.adapter_layer, params.dim)
+        if params.adapter_len * params.adapter_layer > 0:
+            self.adapter_query = nn.Embedding(params.adapter_len * params.adapter_layer, params.dim)
         self.adapter_len = params.adapter_len
         self.adapter_layer = params.adapter_layer
 
@@ -222,40 +315,76 @@ class Transformer(nn.Module):
             self.layers.append(TransformerBlock(layer_id, params))
 
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = Linear(
-            params.dim, params.vocab_size, bias=False
+        self.output = ColumnParallelLinear(
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, examples, labels):
 
+    def forward(self, examples, labels):
         _bsz, seqlen = examples.shape
 
-        with torch.no_grad():
-             h = self.tok_embeddings(examples)
-             freqs_cis = self.freqs_cis.to(h.device)
-             freqs_cis = freqs_cis[:seqlen]
-             mask = None
-             mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=h.device)
-             mask = torch.triu(mask, diagonal=0 + 1).type_as(h)
-             start_pos = 0
-             for layer in self.layers[:-1 * self.adapter_layer]:
-                 h = layer(h, start_pos, freqs_cis, mask)
+        h = self.tok_embeddings(examples)
+        freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = freqs_cis[:seqlen]
+        mask = None
+        mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=h.device)
+        mask = torch.triu(mask, diagonal=0 + 1).type_as(h)
+        start_pos = 0
+        
+        if self.adapter_len * self.adapter_layer > 0:
+            for layer in self.layers[:-1 * self.adapter_layer]:
+                h = layer(h, start_pos, freqs_cis, mask)
+            adapter_index = 0
+            adapter = self.adapter_query.weight.reshape(-1, self.adapter_len, self.params.dim).unsqueeze(1)
+            for layer in self.layers[-1 * self.adapter_layer:]:
+                h = layer(h, start_pos, freqs_cis, mask, adapter[adapter_index].half())
+                adapter_index = adapter_index + 1
 
-        adapter_index = 0
-        adapter = self.adapter_query.weight.reshape(-1, self.adapter_len, 4096).unsqueeze(1)
-        for layer in self.layers[-1 * self.adapter_layer:]:
-            h = layer(h, start_pos, freqs_cis, mask, adapter[adapter_index].half())
-            adapter_index = adapter_index + 1
+        else:
+            for layer in self.layers:
+                h = layer(h, start_pos, freqs_cis, mask)
 
         h = self.norm(h)
         output = self.output(h)
         output = output[:, :-1, :].reshape(-1, self.vocab_size)
         labels = labels[:, 1:].flatten()
 
-
         c_loss = self.criterion(output, labels)
         return c_loss
+
+    @torch.inference_mode()
+    def forward_inference(self, tokens: torch.Tensor, start_pos: int):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos: start_pos + seqlen]
+        if self.adapter_len * self.adapter_layer > 0:
+            adapter = self.adapter_query.weight.reshape(-1, self.adapter_len, self.params.dim).unsqueeze(1)
+        if seqlen == 1:
+            mask = None
+        elif start_pos == 0:
+            mask = torch.full((1, 1, seqlen, seqlen), float('-inf'), device=tokens.device)
+            mask = torch.triu(mask, diagonal=1).type_as(h)
+        else:
+            raise NotImplementedError()
+
+        for i, layer in enumerate(self.layers):
+            adapter_index = i - (len(self.layers) - self.adapter_layer)
+            h = layer(h, start_pos, freqs_cis, mask,
+                adapter[adapter_index].half() if adapter_index >= 0 else None)
+
+        h = self.norm(h)
+        output = self.output(h[:, -1, :])
+        return output.float()
+
+    def enable_cache(self):
+        for layer in self.layers:
+            layer.attention.enable_cache()
+        
+    def disable_cache(self):
+        for layer in self.layers:
+            layer.attention.disable_cache()
